@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========== НАСТРОЙКИ БОТА ===========
-TOKEN = "8418697488:AAGTLsFfLOke4C5ugq15hwe8HxDGQF__N24"  # ВАЖНО: замените на свой токен!
+TOKEN = "" 
 
 # ID админов (те, кто могут банить, выдавать тимбалы)
 ADMIN_IDS = [1719251644]  # ← Ваш ID и ID других главных админов
@@ -1811,3 +1811,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
