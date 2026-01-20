@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========== НАСТРОЙКИ БОТА ===========
-TOKEN = "8418697488:AAGTLsFfLOke4C5ugq15hwe8HxDGQF__N24"
+TOKEN = "8418697488:AAGTLsFfLOke4C5ugq15hwe8HxDGQF__N24"  # ВАЖНО: замените на свой токен!
 
 # ID админов (те, кто могут банить, выдавать тимбалы)
 ADMIN_IDS = [1719251644]  # ← Ваш ID и ID других главных админов
@@ -157,6 +157,34 @@ class Database:
 
         self.conn.commit()
 
+    def update_user_profile(self, user_id: int, roblox_nickname: str = None, photo_id: str = None,
+                            game_modes: str = None):
+        """Обновляет профиль пользователя"""
+        cursor = self.conn.cursor()
+
+        update_fields = []
+        params = []
+
+        if roblox_nickname is not None:
+            update_fields.append("roblox_nickname = ?")
+            params.append(roblox_nickname)
+
+        if photo_id is not None:
+            update_fields.append("photo_id = ?")
+            params.append(photo_id)
+
+        if game_modes is not None:
+            update_fields.append("game_modes = ?")
+            params.append(game_modes)
+
+        update_fields.append("profile_verified = 0")
+
+        if update_fields:
+            query = f"UPDATE users SET {', '.join(update_fields)} WHERE user_id = ?"
+            params.append(user_id)
+            cursor.execute(query, params)
+            self.conn.commit()
+
     def get_user_profile(self, user_id: int):
         """Получает профиль пользователя"""
         cursor = self.conn.cursor()
@@ -171,9 +199,9 @@ class Database:
 
     def reject_profile(self, user_id: int):
         """Отклоняет анкету пользователя"""
-        cursor = self.conn.cursor()
+        cursor = db.conn.cursor()
         cursor.execute('UPDATE users SET profile_verified = 2 WHERE user_id = ?', (user_id,))
-        self.conn.commit()
+        db.conn.commit()
 
     def get_pending_verifications(self):
         """Получает анкеты на проверке"""
@@ -231,6 +259,15 @@ class Database:
         """Добавляет взаимодействие между пользователями"""
         cursor = self.conn.cursor()
 
+        # Проверяем существование записи
+        cursor.execute('''
+            SELECT 1 FROM interactions 
+            WHERE from_user_id = ? AND to_user_id = ? AND is_like = ?
+        ''', (from_user_id, to_user_id, 1 if is_like else 0))
+
+        if cursor.fetchone():
+            return  # Взаимодействие уже существует
+
         cursor.execute('''
             INSERT INTO interactions 
             (from_user_id, to_user_id, is_like, message, sent_at)
@@ -238,26 +275,30 @@ class Database:
         ''', (from_user_id, to_user_id, 1 if is_like else 0, message, datetime.now().isoformat()))
 
         if is_like:
+            # Добавляем тимбалы
             self.add_team_balls(from_user_id, TEAMBALLS_PER_MATCH)
 
+            # Проверяем кулдаун
             cursor.execute('SELECT last_match_time FROM users WHERE user_id = ?', (from_user_id,))
             last_time_result = cursor.fetchone()
 
+            can_add_match = True
             if last_time_result and last_time_result[0]:
                 last_time = datetime.fromisoformat(last_time_result[0])
-                if datetime.now() - last_time >= timedelta(hours=MATCH_COOLDOWN_HOURS):
-                    cursor.execute('''
-                        UPDATE users 
-                        SET matches_found = matches_found + 1, last_match_time = ?
-                        WHERE user_id = ?
-                    ''', (datetime.now().isoformat(), from_user_id))
-            else:
+                time_diff = datetime.now() - last_time
+                if time_diff < timedelta(hours=MATCH_COOLDOWN_HOURS):
+                    can_add_match = False
+                    logger.info(f"Кулдаун для пользователя {from_user_id}: прошло {time_diff}")
+
+            if can_add_match:
                 cursor.execute('''
                     UPDATE users 
                     SET matches_found = matches_found + 1, last_match_time = ?
                     WHERE user_id = ?
                 ''', (datetime.now().isoformat(), from_user_id))
+                logger.info(f"Добавлен матч для пользователя {from_user_id}")
 
+            # Проверяем реферальную программу
             self.check_referral_completion(from_user_id)
 
         self.conn.commit()
@@ -277,8 +318,16 @@ class Database:
     def add_team_balls(self, user_id: int, amount: int):
         """Добавляет тимбалы пользователю"""
         cursor = self.conn.cursor()
-        cursor.execute('UPDATE users SET team_balls = team_balls + ? WHERE user_id = ?', (amount, user_id))
-        self.conn.commit()
+        cursor.execute('SELECT team_balls FROM users WHERE user_id = ?', (user_id,))
+        current = cursor.fetchone()
+
+        if current:
+            new_amount = current[0] + amount
+            cursor.execute('UPDATE users SET team_balls = ? WHERE user_id = ?', (new_amount, user_id))
+            logger.info(f"Тимбалы пользователя {user_id}: {current[0]} + {amount} = {new_amount}")
+            self.conn.commit()
+            return True
+        return False
 
     def check_referral_completion(self, referred_id: int):
         """Проверяет выполнение условий реферальной программы"""
@@ -293,9 +342,12 @@ class Database:
 
             if referral:
                 referrer_id = referral[0]
+                # Даем награду рефереру
                 self.add_team_balls(referrer_id, TEAMBALLS_PER_REFERRAL)
                 cursor.execute('UPDATE referrals SET completed = 1 WHERE referred_id = ?', (referred_id,))
                 self.conn.commit()
+
+                logger.info(f"Реферальная программа выполнена: {referrer_id} получил награду за {referred_id}")
                 return referrer_id
 
         return None
@@ -303,11 +355,17 @@ class Database:
     def add_referral(self, referrer_id: int, referred_id: int):
         """Добавляет реферала"""
         cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT INTO referrals (referrer_id, referred_id, created_at)
-            VALUES (?, ?, ?)
-        ''', (referrer_id, referred_id, datetime.now().isoformat()))
-        self.conn.commit()
+
+        # Проверяем, не существует ли уже запись
+        cursor.execute('SELECT 1 FROM referrals WHERE referrer_id = ? AND referred_id = ?',
+                       (referrer_id, referred_id))
+        if not cursor.fetchone():
+            cursor.execute('''
+                INSERT INTO referrals (referrer_id, referred_id, created_at)
+                VALUES (?, ?, ?)
+            ''', (referrer_id, referred_id, datetime.now().isoformat()))
+            self.conn.commit()
+            logger.info(f"Добавлен реферал: {referrer_id} -> {referred_id}")
 
     def add_purchase(self, user_id: int, promo_type: str, team_balls_spent: int):
         """Добавляет запись о покупке"""
@@ -387,6 +445,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
+    db.add_user(user_id, user.username)
+
+    # Обработка реферальной ссылки
     if context.args:
         referrer_code = context.args[0]
         cursor = db.conn.cursor()
@@ -394,16 +455,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         referrer = cursor.fetchone()
 
         if referrer and referrer[0] != user_id:
-            cursor.execute('SELECT 1 FROM referrals WHERE referrer_id = ? AND referred_id = ?', (referrer[0], user_id))
-            if not cursor.fetchone():
-                db.add_referral(referrer[0], user_id)
-                await update.message.reply_text(
-                    "🎉 Вы присоединились по реферальной ссылке! "
-                    f"Найдите {REFERRAL_MATCHES_REQUIRED} тиммейтов, чтобы ваш друг получил награду.",
-                    reply_markup=get_menu_keyboard()
-                )
+            db.add_referral(referrer[0], user_id)
+            await update.message.reply_text(
+                "🎉 Вы присоединились по реферальной ссылке! "
+                f"Найдите {REFERRAL_MATCHES_REQUIRED} тиммейтов, чтобы ваш друг получил награду.",
+                reply_markup=get_menu_keyboard()
+            )
 
-    db.add_user(user_id, user.username)
     await show_main_menu(update, context)
 
 
@@ -482,19 +540,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("reject_"):
         await handle_reject_profile(query, context)
     elif data == "back_to_menu":
-        # Показываем главное меню напрямую
+        # Используем query для показа меню
+        keyboard = [
+            [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
+            [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
+            [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
+            [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
+            [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
+            [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
+        ]
+
         await query.edit_message_text(
             "🎮 <b>Бот для поиска тиммейтов в Roblox</b>\n\n"
             "Выберите действие:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
-                [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
-                [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
-                [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
-                [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
-                [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
-            ])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         await query.message.reply_text(
             "Ты можешь всегда нажать на кнопку '🏠 В меню' чтобы вернуться сюда",
@@ -549,7 +609,8 @@ async def show_my_profile(query, context):
 
     text = "<b>👤 Ваша анкета:</b>\n\n"
     text += f"<b>📛 Никнейм:</b> {profile[2]}\n"
-    text += f"<b>🎮 Режимы:</b> {profile[4]}\n"
+    if profile[4]:
+        text += f"<b>🎮 Режимы:</b> {profile[4]}\n"
     text += f"<b>📊 Статус:</b> {verification_status}\n"
     text += f"<b>⭐ Лайков:</b> {likes_count}\n"
     text += f"<b>💰 Тимбалов:</b> {profile[6]}\n"
@@ -571,8 +632,7 @@ async def show_my_profile(query, context):
             text += f"└ <b>Время:</b> {time_str}\n\n"
 
     keyboard = []
-    if profile[5] != 1:
-        keyboard.append([InlineKeyboardButton("✏️ Изменить анкету", callback_data="edit_profile")])
+    keyboard.append([InlineKeyboardButton("✏️ Изменить анкету", callback_data="edit_profile")])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
 
     await query.edit_message_text(
@@ -795,72 +855,21 @@ async def handle_like(query, context):
                 return
 
     # Если больше нет пользователей в списке
-    if current_mode == "viewing_likes":
-        message = "🎉 Вы просмотрели всех, кто вас лайкнул! Теперь будут показаны случайные анкеты."
+    keyboard = [
+        [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
+        [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
+        [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
+        [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
+        [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
+        [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
+    ]
 
-        # Ищем случайных тиммейтов
-        random_teammates = db.find_random_teammates(user_id)
-
-        if random_teammates:
-            context.user_data["current_mode"] = "viewing_random"
-            context.user_data["teammates_list"] = [t[0] for t in random_teammates]
-
-            teammate = random_teammates[0]
-            context.user_data["current_teammate"] = teammate[0]
-
-            text = f"<b>👤 Никнейм:</b> {teammate[2]}\n<b>🎮 Режимы:</b> {teammate[4]}\n\n"
-            text += f"<b>💡 Найдено тиммейтов:</b> {teammate[12]}\n"
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{teammate[0]}"),
-                    InlineKeyboardButton("💩 Дизлайк", callback_data=f"dislike_{teammate[0]}")
-                ],
-                [InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]
-            ]
-
-            await query.edit_message_text(
-                message,
-                parse_mode=ParseMode.HTML
-            )
-
-            try:
-                if teammate[3]:
-                    await query.message.reply_photo(
-                        photo=teammate[3],
-                        caption=text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                else:
-                    await query.message.reply_text(
-                        text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-            except:
-                await query.message.reply_text(
-                    text + "\n<b>🖼 Фото:</b> (не удалось загрузить)\n",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            return
-        else:
-            message += "\n\n😔 Но пока нет других подходящих тиммейтов."
-
-    # Возвращаемся в главное меню
     await query.edit_message_text(
+        "🎉 Вы просмотрели всех пользователей!\n\n"
         "🎮 <b>Бот для поиска тиммейтов в Roblox</b>\n\n"
         "Выберите действие:",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
-            [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
-            [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
-            [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
-            [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
-            [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
-        ])
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     await query.message.reply_text(
         "Ты можешь всегда нажать на кнопку '🏠 В меню' чтобы вернуться сюда",
@@ -929,72 +938,21 @@ async def handle_dislike(query, context):
                 return
 
     # Если больше нет пользователей в списке
-    if current_mode == "viewing_likes":
-        message = "🎉 Вы просмотрели всех, кто вас лайкнул! Теперь будут показаны случайные анкеты."
+    keyboard = [
+        [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
+        [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
+        [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
+        [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
+        [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
+        [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
+    ]
 
-        # Ищем случайных тиммейтов
-        random_teammates = db.find_random_teammates(user_id)
-
-        if random_teammates:
-            context.user_data["current_mode"] = "viewing_random"
-            context.user_data["teammates_list"] = [t[0] for t in random_teammates]
-
-            teammate = random_teammates[0]
-            context.user_data["current_teammate"] = teammate[0]
-
-            text = f"<b>👤 Никнейм:</b> {teammate[2]}\n<b>🎮 Режимы:</b> {teammate[4]}\n\n"
-            text += f"<b>💡 Найдено тиммейтов:</b> {teammate[12]}\n"
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{teammate[0]}"),
-                    InlineKeyboardButton("💩 Дизлайк", callback_data=f"dislike_{teammate[0]}")
-                ],
-                [InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]
-            ]
-
-            await query.edit_message_text(
-                message,
-                parse_mode=ParseMode.HTML
-            )
-
-            try:
-                if teammate[3]:
-                    await query.message.reply_photo(
-                        photo=teammate[3],
-                        caption=text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                else:
-                    await query.message.reply_text(
-                        text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-            except:
-                await query.message.reply_text(
-                    text + "\n<b>🖼 Фото:</b> (не удалось загрузить)\n",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            return
-        else:
-            message += "\n\n😔 Но пока нет других подходящих тиммейтов."
-
-    # Возвращаемся в главное меню
     await query.edit_message_text(
+        "🎉 Вы просмотрели всех пользователей!\n\n"
         "🎮 <b>Бот для поиска тиммейтов в Roblox</b>\n\n"
         "Выберите действие:",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
-            [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
-            [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
-            [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
-            [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
-            [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
-        ])
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     await query.message.reply_text(
         "Ты можешь всегда нажать на кнопку '🏠 В меню' чтобы вернуться сюда",
@@ -1162,7 +1120,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state_data = user_states[user_id]
 
         if state_data["state"] == "waiting_nickname":
-            context.user_data["roblox_nickname"] = message_text
+            if len(message_text.strip()) < 2:
+                await update.message.reply_text(
+                    "❌ Слишком короткий никнейм. Введите заново:",
+                    reply_markup=get_menu_keyboard()
+                )
+                return
+
+            context.user_data["roblox_nickname"] = message_text.strip()
             user_states[user_id] = {"state": "waiting_photo"}
             await update.message.reply_text(
                 "📸 Теперь отправьте фото вашего скина в Roblox:\n\n"
@@ -1171,23 +1136,34 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif state_data["state"] == "waiting_game_modes":
-            context.user_data["game_modes"] = message_text
+            if len(message_text.strip()) < 3:
+                await update.message.reply_text(
+                    "❌ Слишком короткое описание режимов. Введите заново:",
+                    reply_markup=get_menu_keyboard()
+                )
+                return
 
-            db.add_to_verification(
-                user_id,
-                context.user_data["roblox_nickname"],
-                context.user_data.get("photo_id", ""),
-                message_text
+            context.user_data["game_modes"] = message_text.strip()
+
+            # Получаем сохраненные данные
+            roblox_nickname = context.user_data.get("roblox_nickname", "")
+            photo_id = context.user_data.get("photo_id", "")
+
+            db.update_user_profile(
+                user_id=user_id,
+                roblox_nickname=roblox_nickname,
+                photo_id=photo_id,
+                game_modes=message_text.strip()
             )
 
-            profile = db.get_user_profile(user_id)
+            # Отправляем верификаторам
             for verifier_id in VERIFIER_IDS + ADMIN_AND_VERIFIER_IDS:
                 try:
                     text = f"<b>📝 Новая анкета на проверку!</b>\n\n"
                     text += f"<b>Пользователь:</b> @{update.effective_user.username or 'нет'}\n"
                     text += f"<b>ID:</b> {user_id}\n"
-                    text += f"<b>Ник в Roblox:</b> {context.user_data['roblox_nickname']}\n"
-                    text += f"<b>Режимы:</b> {message_text}"
+                    text += f"<b>Ник в Roblox:</b> {roblox_nickname}\n"
+                    text += f"<b>Режимы:</b> {message_text.strip()}"
 
                     keyboard = [
                         [
@@ -1203,10 +1179,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
 
-                    if "photo_id" in context.user_data:
+                    if photo_id:
                         await context.bot.send_photo(
                             verifier_id,
-                            photo=context.user_data["photo_id"],
+                            photo=photo_id,
                             caption="Фото скина"
                         )
                 except Exception as e:
@@ -1298,7 +1274,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_id in user_states and user_states[user_id]["state"] == "waiting_photo":
-        # Получаем file_id фото
+        # Получаем file_id фото (самое большое фото)
         photo_file_id = update.message.photo[-1].file_id
         context.user_data["photo_id"] = photo_file_id  # Сохраняем file_id
 
@@ -1308,6 +1284,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎮 Теперь введите игровые режимы, в которые вы играете (через запятую):\n"
             "Пример: BedWars, Murder Mystery 2, Tower of Hell\n\n"
             "Нажмите '🏠 В меню' для отмены",
+            reply_markup=get_menu_keyboard()
+        )
+    else:
+        # Если фото отправлено не в процессе создания анкеты
+        await update.message.reply_text(
+            "📸 Фото получено, но сейчас не требуется.",
             reply_markup=get_menu_keyboard()
         )
 
@@ -1337,16 +1319,21 @@ async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Укажите пользователя")
             return
 
-        db.add_team_balls(target_id, amount)
-        await update.message.reply_text(f"✅ Пользователю {target_id} выдано {amount} тимбалов")
+        if db.add_team_balls(target_id, amount):
+            await update.message.reply_text(f"✅ Пользователю {target_id} выдано {amount} тимбалов")
 
-        try:
-            await context.bot.send_message(target_id, f"🎉 Администратор выдал вам {amount} тимбалов!")
-        except:
-            pass
+            try:
+                await context.bot.send_message(target_id, f"🎉 Администратор выдал вам {amount} тимбалов!")
+            except:
+                pass
+        else:
+            await update.message.reply_text("❌ Пользователь не найден")
 
-    except:
-        await update.message.reply_text("❌ Использование: /give <количество> [@username или id]")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат числа")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка в admin_give: {e}")
 
 
 async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1376,6 +1363,11 @@ async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.conn.commit()
 
         await update.message.reply_text(f"✅ Пользователь {target_id} забанен")
+
+        try:
+            await context.bot.send_message(target_id, "❌ Вы были забанены администратором!")
+        except:
+            pass
 
     except:
         await update.message.reply_text("❌ Использование: /ban [@username или id]")
@@ -1408,6 +1400,11 @@ async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.conn.commit()
 
         await update.message.reply_text(f"✅ Пользователь {target_id} разбанен")
+
+        try:
+            await context.bot.send_message(target_id, "✅ Вы были разбанены администратором!")
+        except:
+            pass
 
     except:
         await update.message.reply_text("❌ Использование: /unban [@username или id]")
@@ -1533,6 +1530,11 @@ async def admin_clearpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.conn.commit()
 
         await update.message.reply_text(f"✅ Тимбалы пользователя {target_id} очищены")
+
+        try:
+            await context.bot.send_message(target_id, "⚠️ Ваши тимбалы были обнулены администратором!")
+        except:
+            pass
 
     except:
         await update.message.reply_text("❌ Использование: /clearpoint [@username или id]")
@@ -1742,19 +1744,20 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "message_for_user" in context.user_data:
             del context.user_data["message_for_user"]
 
-        # Показываем главное меню напрямую
+        keyboard = [
+            [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
+            [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
+            [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
+            [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
+            [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
+            [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
+        ]
+
         await query.edit_message_text(
             "🎮 <b>Бот для поиска тиммейтов в Roblox</b>\n\n"
             "Выберите действие:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👤 Моя анкета", callback_data="my_profile")],
-                [InlineKeyboardButton("🔍 Искать тиммейта", callback_data="find_teammate")],
-                [InlineKeyboardButton("🤝 Найденные тиммейты", callback_data="found_teammates")],
-                [InlineKeyboardButton("🏪 Магазин", callback_data="shop")],
-                [InlineKeyboardButton("🔗 Реф ссылка", callback_data="referral")],
-                [InlineKeyboardButton("📞 Поддержка", callback_data="support")]
-            ])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         await query.message.reply_text(
             "Ты можешь всегда нажать на кнопку '🏠 В меню' чтобы вернуться сюда",
@@ -1797,12 +1800,14 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
     # Запуск
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == '__main__':
+    logger.info("Бот запускается...")
     print("Бот запускается...")
     print(f"Админы: {ADMIN_IDS}")
     print(f"Верификаторы: {VERIFIER_IDS}")
     print(f"Админы+Верификаторы: {ADMIN_AND_VERIFIER_IDS}")
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
     main()
